@@ -1,4 +1,3 @@
-
 import os
 import re
 import uuid
@@ -46,11 +45,12 @@ DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
-FFMPEG_PATH = (
-    r"C:\Users\HP\AppData\Local\Microsoft\WinGet\Packages"
-    r"\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe"
-    r"\ffmpeg-9.0.2-full_build-shared\bin"
-)
+FFMPEG_PATH = shutil.which("ffmpeg")
+
+if not FFMPEG_PATH:
+    raise RuntimeError(
+        "FFmpeg topilmadi. FFmpeg PATH sozlamasini tekshiring."
+    )
 
 # Vaqtinchalik URL'lar: key = tasodifiy ID
 pending_downloads: dict[str, dict] = {}
@@ -92,24 +92,163 @@ def get_platform(url: str) -> str | None:
 
 
 # =========================================================
-# YOUTUBE QUALITY KEYBOARD
+# YOUTUBE FORMATLARINI ANIQLASH
 # =========================================================
 
-def quality_keyboard(request_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="360p",
-                    callback_data=f"quality:360:{request_id}",
-                ),
-                InlineKeyboardButton(
-                    text="720p",
-                    callback_data=f"quality:720:{request_id}",
-                ),
-            ]
+
+async def get_youtube_formats(url: str) -> list[dict]:
+    def _extract() -> list[dict]:
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "cachedir": False,
+            "socket_timeout": 20,
+            "skip_download": True,
+        }
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        all_formats = info.get("formats", [])
+
+        # Audio oqimlarini aniqlash
+        audio_formats = [
+            fmt for fmt in all_formats
+            if fmt.get("acodec") not in (None, "none")
+            and fmt.get("vcodec") in (None, "none")
         ]
-    )
+
+        best_audio = max(
+            audio_formats,
+            key=lambda fmt: (
+                fmt.get("filesize")
+                or fmt.get("filesize_approx")
+                or 0
+            ),
+            default=None,
+        )
+
+        audio_size = (
+            (best_audio.get("filesize")
+             or best_audio.get("filesize_approx")
+             or 0)
+            if best_audio else 0
+        )
+
+        # Har bir sifat uchun bitta eng mos format
+        best_by_height = {}
+
+        for fmt in all_formats:
+            height = fmt.get("height")
+            format_id = fmt.get("format_id")
+            ext = fmt.get("ext")
+            vcodec = fmt.get("vcodec")
+
+            if not height or not format_id:
+                continue
+
+            if ext not in {"mp4", "webm"}:
+                continue
+
+            if vcodec in (None, "none"):
+                continue
+
+            has_audio = fmt.get("acodec") not in (None, "none")
+
+            video_size = (
+                fmt.get("filesize")
+                or fmt.get("filesize_approx")
+                or 0
+            )
+
+            total_size = (
+                video_size
+                if has_audio
+                else video_size + audio_size
+            )
+
+            # MP4 va audio bilan tayyor formatlarga ustunlik
+            score = (
+                ext == "mp4",
+                has_audio,
+                video_size > 0,
+                video_size,
+            )
+
+            item = {
+                "format_id": format_id,
+                "height": height,
+                "ext": ext,
+                "filesize": total_size or None,
+                "has_audio": has_audio,
+            }
+
+            current = best_by_height.get(height)
+
+            if current is None or score > current["_score"]:
+                item["_score"] = score
+                best_by_height[height] = item
+
+        formats = list(best_by_height.values())
+
+        for fmt in formats:
+            fmt.pop("_score", None)
+
+        return sorted(
+            formats,
+            key=lambda item: item["height"],
+        )
+
+    return await asyncio.to_thread(_extract)
+
+
+
+# =========================================================
+# YOUTUBE FORMAT TUGMALARI
+# =========================================================
+
+
+def formats_keyboard(
+    request_id: str,
+    formats: list[dict],
+) -> InlineKeyboardMarkup:
+    buttons = []
+
+    for fmt in formats:
+        height = fmt["height"]
+        size = fmt["filesize"]
+
+        if height >= 2160:
+            quality_label = "4K"
+        elif height >= 1440:
+            quality_label = "2K"
+        else:
+            quality_label = f"{height}p"
+
+        size_text = (
+            f" · {size / (1024 * 1024):.0f} MB"
+            if size else ""
+        )
+
+        buttons.append(
+            InlineKeyboardButton(
+                text=f"📹 {quality_label}{size_text}",
+                callback_data=(
+                    f'format:{request_id}:{fmt["format_id"]}'
+                ),
+            )
+        )
+
+    # Har qatorda 3 ta tugma
+    rows = [
+        buttons[i:i + 3]
+        for i in range(0, len(buttons), 3)
+    ]
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 
 
 # =========================================================
@@ -120,6 +259,8 @@ async def download_video(
     url: str,
     platform: str,
     quality: int | None = None,
+    format_id: str | None = None,
+    has_audio: bool = False,
 ) -> Path:
     tmp_dir = Path(
         tempfile.mkdtemp(prefix="video_bot_", dir=DOWNLOAD_ROOT)
@@ -142,65 +283,45 @@ async def download_video(
             }
 
             if platform == "youtube":
-                height = quality or 360
+                if not format_id:
+                    raise RuntimeError(
+                        "YouTube formati tanlanmagan."
+                    )
 
-                # Avval tayyor MP4 format, so'ng alohida
-                # video/audio oqimlari, keyin pastroq sifat.
-                formats = [
-                    f"best[height<={height}][ext=mp4]/"
-                    f"best[height<={height}]",
+                format_selector = (
+                    format_id
+                    if has_audio
+                    else f"{format_id}+bestaudio"
+                )
 
-                    f"bestvideo[height<={height}][ext=mp4]+"
-                    f"bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={height}]+bestaudio/"
-                    f"best[height<={height}]",
+                opts = {
+                    **base_opts,
+                    "format": format_selector,
+                    "merge_output_format": "mp4",
+                }
 
-                    "best",
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.extract_info(url, download=True)
+
+                files = [
+                    p for p in tmp_dir.iterdir()
+                    if p.is_file()
+                    and p.stat().st_size > 0
+                    and p.suffix.lower() not in {
+                        ".part", ".ytdl", ".temp", ".json"
+                    }
                 ]
 
-                last_error = None
+                if not files:
+                    raise RuntimeError(
+                        "Yuklangan YouTube video fayli topilmadi."
+                    )
 
-                for fmt in formats:
-                    try:
-                        opts = {
-                            **base_opts,
-                            "format": fmt,
-                            "merge_output_format": "mp4",
-                        }
-
-                        with yt_dlp.YoutubeDL(opts) as ydl:
-                            ydl.extract_info(url, download=True)
-
-                        files = [
-                            p for p in tmp_dir.iterdir()
-                            if p.is_file()
-                            and p.stat().st_size > 0
-                            and p.suffix.lower() not in {
-                                ".part", ".ytdl", ".temp"
-                            }
-                        ]
-
-                        if files:
-                            return max(
-                                files,
-                                key=lambda p: p.stat().st_mtime,
-                            )
-
-                        raise RuntimeError(
-                            "Yuklangan video fayli topilmadi."
-                        )
-
-                    except Exception as exc:
-                        last_error = exc
-                        logger.warning(
-                            "YouTube format %s ishlamadi: %s",
-                            fmt,
-                            exc,
-                        )
-
-                raise RuntimeError(
-                    f"YouTube yuklab olish muvaffaqiyatsiz: {last_error}"
+                return max(
+                    files,
+                    key=lambda p: p.stat().st_mtime,
                 )
+
 
             # Instagram: sifat tanlash yo'q.
             # Sayt taqdim etgan eng yaxshi mavjud format.
@@ -248,6 +369,8 @@ async def process_video(
     platform: str,
     quality: int | None = None,
     status_message: types.Message | None = None,
+    format_id: str | None = None,
+    has_audio: bool = False
 ):
     user_id = message.from_user.id if message.from_user else 0
 
@@ -284,6 +407,8 @@ async def process_video(
             url=url,
             platform=platform,
             quality=quality,
+            format_id=format_id,
+            has_audio=has_audio,
         )
 
         if not video_path.exists():
@@ -317,8 +442,9 @@ async def process_video(
 
         await status_message.delete()
 
-    except Exception as exc:
+    except Exception:
         logger.exception("Video download/send failed")
+
         error_text = (
             "❌ Videoni yuklab olish yoki yuborishda xatolik yuz berdi. "
             "Havolani tekshirib, qayta urinib ko'ring."
@@ -331,11 +457,7 @@ async def process_video(
                 await message.answer(error_text)
         else:
             await message.answer(error_text)
-
     finally:
-        if video_path:
-            shutil.rmtree(video_path.parent, ignore_errors=True)
-
         active_users.discard(user_id)
 
 
@@ -347,18 +469,19 @@ async def process_video(
 async def cmd_start(message: types.Message):
     await message.answer(
         "Assalomu alaykum! 🎥\n\n"
-        "YouTube havolasini yuboring va 360p yoki 720p sifatni tanlang.\n"
+        "YouTube havolasini yuboring — mavjud formatlar "
+        "avtomatik aniqlanadi.\n"
         "Instagram havolalari esa avtomatik yuklanadi.\n\n"
         "Foydalanish uchun video havolasini yuboring."
     )
 
 
 # =========================================================
-# YOUTUBE QUALITY CALLBACK
+# YOUTUBE FORMAT CALLBACK
 # =========================================================
 
-@dp.callback_query(F.data.startswith("quality:"))
-async def quality_callback(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("format:"))
+async def format_callback(callback: CallbackQuery):
     if not callback.data or not callback.message:
         await callback.answer(
             "So'rovni qayta yuboring.",
@@ -367,17 +490,13 @@ async def quality_callback(callback: CallbackQuery):
         return
 
     try:
-        _, quality_text, request_id = callback.data.split(":", 2)
-        quality = int(quality_text)
-
-        if quality not in (360, 720):
-            raise ValueError("Noto'g'ri sifat.")
+        _, request_id, format_id = callback.data.split(":", 2)
 
         request = pending_downloads.get(request_id)
 
         if not request:
             await callback.answer(
-                "Havola eskirgan. Iltimos, qayta yuboring.",
+                "Havola eskirgan. Qayta yuboring.",
                 show_alert=True,
             )
             return
@@ -389,31 +508,53 @@ async def quality_callback(callback: CallbackQuery):
             )
             return
 
-        # Tugmani qayta bosishni bloklash
+        # Format ID ushbu so'rovga tegishli ekanini tekshirish
+        allowed_formats = {
+            item["format_id"]
+            for item in request["formats"]
+        }
+
+        if format_id not in allowed_formats:
+            await callback.answer(
+                "Format noto'g'ri. Havolani qayta yuboring.",
+                show_alert=True,
+            )
+            return
+
+        # Bir foydalanuvchi uchun takroriy tanlovni bloklash
         pending_downloads.pop(request_id, None)
 
-        await callback.answer(f"{quality}p tanlandi.")
+        await callback.answer("Format tanlandi.")
 
         await callback.message.edit_reply_markup(
             reply_markup=None
         )
 
-        original_message = request["message"]
+        selected_format = next(
+            item for item in request["formats"]
+            if item["format_id"] == format_id
+        )
 
         await process_video(
-            message=original_message,
+            message=request["message"],
             url=request["url"],
             platform="youtube",
-            quality=quality,
+            format_id=format_id,
+            quality=selected_format["height"],
             status_message=callback.message,
+            has_audio=selected_format["has_audio"],
         )
 
-    except (ValueError, KeyError):
-        logger.exception("Invalid quality callback")
-        await callback.answer(
-            "Sifatni tanlashda xatolik yuz berdi.",
-            show_alert=True,
-        )
+    except Exception:
+        logger.exception("YouTube format callback xatosi")
+
+        try:
+            await callback.answer(
+                "Formatni tanlashda xatolik yuz berdi.",
+                show_alert=True,
+            )
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -435,18 +576,44 @@ async def handle_message(message: types.Message):
         return
 
     if platform == "youtube":
-        request_id = uuid.uuid4().hex[:12]
-
-        pending_downloads[request_id] = {
-            "url": url,
-            "user_id": message.from_user.id,
-            "message": message,
-        }
-
-        await message.answer(
-            "🎬 YouTube videosi uchun sifatni tanlang:",
-            reply_markup=quality_keyboard(request_id),
+        status_message = await message.answer(
+            "🔎 YouTube formatlari aniqlanmoqda..."
         )
+
+        try:
+            formats = await get_youtube_formats(url)
+
+            if not formats:
+                await status_message.edit_text(
+                    "❌ Ushbu videoda mos formatlar topilmadi."
+                )
+                return
+
+            request_id = uuid.uuid4().hex[:12]
+
+            pending_downloads[request_id] = {
+                "url": url,
+                "user_id": message.from_user.id,
+                "message": message,
+                "formats": formats,
+            }
+
+            await status_message.edit_text(
+                "🎬 Mavjud video formatlaridan birini tanlang:",
+                reply_markup=formats_keyboard(
+                    request_id,
+                    formats,
+                ),
+            )
+
+        except Exception:
+            logger.exception("YouTube formatlarini aniqlashda xato")
+
+            await status_message.edit_text(
+                "❌ Video formatlarini aniqlab bo'lmadi. "
+                "Havolani tekshirib, qayta urinib ko'ring."
+            )
+
         return
 
     # Instagram: to'g'ridan-to'g'ri yuklab olish
