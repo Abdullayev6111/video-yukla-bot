@@ -6,6 +6,7 @@ import tempfile
 import logging
 import asyncio
 import urllib.parse
+from aiohttp import web
 
 from pathlib import Path
 
@@ -58,6 +59,24 @@ pending_downloads: dict[str, dict] = {}
 # Bir foydalanuvchi bir vaqtning o'zida ko'p yuklash boshlamasin
 active_users: set[int] = set()
 
+
+
+async def health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+async def start_web_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    return runner
 
 # =========================================================
 # URL VALIDATION
@@ -624,17 +643,24 @@ async def handle_message(message: types.Message):
     )
 
 
+
 # =========================================================
 # RUN BOT
 # =========================================================
 
 async def main():
     logger.info("Bot ishga tushmoqda...")
+
+    runner = await start_web_server()
+
     try:
+        logger.info("HTTP server ishga tushdi.")
         await dp.start_polling(bot)
     finally:
+        await runner.cleanup()
         await bot.session.close()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
